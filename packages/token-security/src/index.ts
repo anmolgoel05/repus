@@ -1,0 +1,6 @@
+import {createCipheriv,createDecipheriv,createHash,randomBytes} from 'node:crypto';
+const keyFor=(secret:string)=>createHash('sha256').update(secret).digest();
+export const tokenHash=(token:string)=>createHash('sha256').update(token).digest('hex');
+export function createOpaqueToken(){return randomBytes(32).toString('base64url');}
+export function encryptToken(token:string,secret:string){if(secret.length<32)throw new Error('SESSION_SECRET must contain at least 32 characters.');const nonce=randomBytes(12);const cipher=createCipheriv('aes-256-gcm',keyFor(secret),nonce);const body=Buffer.concat([cipher.update(token,'utf8'),cipher.final()]);return Buffer.concat([nonce,cipher.getAuthTag(),body]).toString('base64url');}
+export function decryptToken(value:string,secret:string){if(!/^[A-Za-z0-9_-]+$/.test(value))throw new Error('Invalid encrypted token.');const bytes=Buffer.from(value,'base64url');if(bytes.length<29||bytes.toString('base64url')!==value)throw new Error('Invalid encrypted token.');const decipher=createDecipheriv('aes-256-gcm',keyFor(secret),bytes.subarray(0,12));decipher.setAuthTag(bytes.subarray(12,28));return Buffer.concat([decipher.update(bytes.subarray(28)),decipher.final()]).toString('utf8');}

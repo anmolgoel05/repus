@@ -1,0 +1,25 @@
+{
+  "name": "@repus/event-worker",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "node ../../tools/run-with-env.cjs --worker-db tsx watch src/main.ts",
+    "build": "node ../../tools/run-with-env.cjs tsc -p tsconfig.json",
+    "start": "node ../../tools/run-with-env.cjs --worker-db node dist/main.js",
+    "test": "vitest run --config ../../vitest.config.mts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@aws-sdk/client-sqs": "^3.723.0",
+    "@repus/database": "*",
+    "@repus/validation": "*",
+    "bullmq": "^5.34.10",
+    "ioredis": "^5.4.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3",
+    "vitest": "^5.0.5"
+  }
+}

@@ -1,0 +1,48 @@
+# AWS infrastructure
+
+## Private application storage
+
+`private-storage.json` creates a dedicated bucket for CSV staging and campaign images, with all four public-access blocks, bucket-owner-enforced ownership (ACLs disabled), default SSE-S3/AES256 encryption and a bucket policy denying non-TLS requests. S3 Object Ownership behavior is documented in [AWS ownership controls](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-properties-s3-bucket-ownershipcontrols.html). This template is separate from SES so storage can be configured independently. Local validation creates no resources.
+
+```powershell
+cfn-lint infrastructure/aws/private-storage.json
+aws cloudformation deploy `
+  --template-file infrastructure/aws/private-storage.json `
+  --stack-name repus-storage-production `
+  --capabilities CAPABILITY_NAMED_IAM `
+  --parameter-overrides ResourcePrefix=repus-prod
+```
+
+Deploy in the same region as `AWS_REGION`. Set the `PrivateBucketName` output as `AWS_S3_BUCKET` on the API and sending/import worker. Attach `ApiStoragePolicyArn` only to the API runtime role and `WorkerStoragePolicyArn` only to the sending/import worker role. The web and event worker need neither policy. API permissions cover put/get/delete and aborting failed multipart uploads; the SDK uses `s3:PutObject` for multipart creation, parts and completion ([AWS multipart permissions](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html)). The worker can read/delete objects and list this bucket for its bounded orphan sweep, but cannot upload or administer the bucket. Neither runtime policy grants ACL changes or access to other buckets. Tenant authorization remains enforced by API/database context and private object capabilities; these shared service roles are not tenant credentials.
+
+The one-day lifecycle rule aborts incomplete multipart uploads only. Completed images have no age-based expiration because sent email and saved templates may reference them. CSV objects are removed by import processing; review failed imports and storage retention as part of operations. Versioning is not enabled, avoiding hidden retained versions after privacy deletion. The bucket and TLS-deny policy are retained on stack deletion/replacement, so decommissioning requires an explicit data-retention/deletion decision and accounting for ongoing storage costs. Do not use this bucket for PostgreSQL backups; no backup transfer or recovery artifact upload is configured here.
+
+Before production acceptance, use the actual API role to upload a synthetic CSV and image, verify preview/media access and private anonymous denial, then import the CSV with the worker role and verify cleanup. Check orphan cleanup preserves database-referenced images, rejects young/unrelated objects and only removes stale unregistered images. Confirm API bucket-list/administration and worker upload attempts are denied. These live AWS checks remain pending; template lint and local permission regressions do not prove deployed access. Set `PUBLIC_MEDIA_URL` to the HTTPS API origin; never make the bucket public to fix rendering.
+
+## SES event infrastructure
+
+Deploy `ses-events.yaml` in the same AWS region as the Repus worker. The stack creates an SES domain identity with Easy DKIM, a configuration set, an SNS event topic, an encrypted SQS queue with a five-receive dead-letter policy, and the corresponding publish/queue resource policies. It also creates separate IAM managed policies for API SES reads, worker SES sends, and event consumption for the event queue.
+
+Both SNS topics use a rotating customer-managed KMS key. Its service grants permit SES only for this account/configuration set and CloudWatch only for this account's prefixed alarms. AWS-managed `alias/aws/sns` cannot be customized to grant those publishers the required encryption permissions; see [AWS SNS key management](https://docs.aws.amazon.com/sns/latest/dg/sns-key-management.html). Key policies use `Resource: '*'` to refer to the key the policy is attached to; runtime application IAM policies receive no KMS administration rights. The key is retained on stack deletion/replacement to preserve access to retained encrypted data; include retained keys and their costs in the operator decommissioning plan. No resources are provisioned by local template validation.
+
+Validate locally before deployment with `cfn-lint infrastructure/aws/ses-events.yaml` (verified with cfn-lint 1.59.0). This checks resource schemas and references, including the SES SNS destination's case-sensitive `TopicARN` property. Passing template validation does not prove deployed IAM/KMS permissions or end-to-end notification delivery; run the production smoke and alarm tests below after deployment.
+
+```powershell
+aws cloudformation deploy `
+  --template-file infrastructure/aws/ses-events.yaml `
+  --stack-name repus-ses-production `
+  --capabilities CAPABILITY_NAMED_IAM `
+  --parameter-overrides SendingDomain=mail.example.com SendingIdentityArns=arn:aws:ses:us-east-1:123456789012:identity/mail.example.com ConfigurationSetName=repus-production ResourcePrefix=repus-prod AlertEmail=on-call@example.com
+```
+
+Replace the example AWS account and region in `SendingIdentityArns` with the exact ARN for the configured identity. The parameter validates each comma-separated entry as a concrete SES identity ARN and rejects wildcard resources. Include every SES identity the API and email worker need to send from or inspect, comma-separated, such as `...:identity/mail.example.com,...:identity/tenant.example.org`. The `SendingDomain` identity is created by this stack; any additional tenant identity must be provisioned separately in SES and included explicitly. Re-deploy after adding identities. Read the stack outputs and add the three DKIM CNAME records at the authoritative DNS provider. SES identity verification is asynchronous; wait until SES reports the domain verified and DKIM enabled. Publish the output values as `AWS_SES_CONFIGURATION_SET`, `AWS_SES_SNS_TOPIC_ARN`, and `AWS_SES_SQS_URL` in the matching Repus services. Attach `ApiSesReadPolicyArn` only to the API role, `EmailWorkerPolicyArn` only to the email worker role, and `EventWorkerPolicyArn` only to the event-worker role. Remove any previous attachment of `EmailWorkerPolicyArn` from the API role when upgrading. The API can inspect configured identities but cannot send; the worker can send but cannot inspect identities. Both policies scope identity operations to `SendingIdentityArns`; account quota reads use the SES account-level resource. The runtime role cannot create arbitrary identities. Domain onboarding checks for an identity that an operator provisioned beforehand. Do not grant `identity/*`. Do not put AWS access keys in the web app or commit them.
+
+Set `AlertEmail` during deployment to create an email subscription for the operations alert topic, then confirm the SNS subscription email. CloudWatch alarms notify that topic when the SES event queue's oldest message exceeds five minutes, a message reaches the DLQ, account bounce/complaint reputation rates exceed the configured thresholds, aggregate BullMQ terminal failures exceed 10, queue health queries fail, the worker heartbeat is missing for five minutes, or the API emits a server error. Defaults are 4% bounce and 0.08% complaint; tune them for your policy with `BounceRateAlarmThreshold` and `ComplaintRateAlarmThreshold`. SES publishes reputation metrics under `AWS/SES`; they may remain absent until the account sends production traffic. If no address is supplied, the alarms and topic are still created and can be connected to an incident system using the `OperationsAlertTopicArn` output.
+
+The sending worker writes CloudWatch Embedded Metric Format records for BullMQ queue counts every minute in production. The API emits a 5xx metric when its global exception filter handles a server error. The event worker reports a heartbeat after successful SQS polls, including empty responses, at most once per minute per process. Its queue-specific alarm treats missing data as a failure so it can detect a poller outage on an idle queue.
+
+Ship JSON logs from the API and both workers to CloudWatch Logs. Verify `Repus/Queues`, `Repus/API`, and `Repus/Events` before relying on the alarms. For the poll heartbeat, confirm that `SqsPollHeartbeat` appears with the expected `QueueName` dimension. On a controlled deployment, stop the event worker and check the alert, then restart it and confirm the alarm clears after successful polling resumes. Live alarm delivery remains a deployment acceptance check.
+
+The template does not request SES production access, create SPF/DMARC records, provision tenant-owned identities, set up private S3, or configure application secrets. Request production access separately in SES, publish SPF and DMARC records, provision each tenant sender identity and include its explicit ARN in `SendingIdentityArns`, verify tenant sender domains through the Repus domain flow, and follow the outputs with a signed event delivery smoke test. The admin health page shows SES sandbox and quota status. Messages that fail event processing are retried by SQS and eventually retained in the DLQ for operator inspection.
+
+The SES event destination publishes send, reject, bounce, complaint, delivery, delay, subscription, and rendering-failure events. It intentionally omits SES open and click events because Repus records engagement through its own tracking pixel and redirect endpoints; enabling both sources would double-count engagement. Reject is accounted as provider acceptance because SES defines it as an accepted message that SES then refuses to deliver.

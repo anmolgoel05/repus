@@ -1,0 +1,224 @@
+services:
+  db-roles:
+    image: postgres:16-alpine
+    restart: "no"
+    environment:
+      PGHOST: postgres
+      PGUSER: repus
+      PGDATABASE: repus
+      PGPASSWORD: ${POSTGRES_PASSWORD:-repus_dev_password}
+      API_DB_PASSWORD: ${API_DB_PASSWORD:-repus_api_dev_password}
+      WORKER_DB_PASSWORD: ${WORKER_DB_PASSWORD:-repus_worker_dev_password}
+    command: ["psql", "-v", "ON_ERROR_STOP=1", "-f", "/role-bootstrap.sql"]
+    volumes:
+      - ./infrastructure/postgres/01-application-roles.sql:/role-bootstrap.sql:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+  db-backup:
+    profiles: ["backups"]
+    build:
+      context: .
+      target: postgres-backup
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://repus_worker:${WORKER_DB_PASSWORD:-repus_worker_dev_password}@postgres:5432/repus
+      BACKUP_ENCRYPTION_KEY: ${POSTGRES_BACKUP_ENCRYPTION_KEY:-}
+      BACKUP_DIR: /backups
+      BACKUP_INTERVAL_SECONDS: ${POSTGRES_BACKUP_INTERVAL_SECONDS:-86400}
+      BACKUP_RETENTION_DAYS: ${POSTGRES_BACKUP_RETENTION_DAYS:-30}
+    volumes:
+      - postgres_backups:/backups
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+  migrate:
+    build:
+      context: .
+      target: api
+    restart: "no"
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      DATABASE_URL: postgresql://repus:${POSTGRES_PASSWORD:-repus_dev_password}@postgres:5432/repus?schema=public
+    command: ["npm", "run", "db:migrate"]
+    depends_on:
+      db-roles:
+        condition: service_completed_successfully
+  api:
+    init: true
+    build:
+      context: .
+      target: api
+    restart: unless-stopped
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      DATABASE_URL: postgresql://repus_api:${API_DB_PASSWORD:-repus_api_dev_password}@postgres:5432/repus?schema=public
+      REDIS_URL: redis://redis:6379
+      NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:4000}
+      API_URL: ${API_URL:-http://localhost:4000}
+      PUBLIC_MEDIA_URL: ${PUBLIC_MEDIA_URL:-http://localhost:4000}
+      TRACKING_BASE_URL: ${TRACKING_BASE_URL:-http://localhost:4000}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      EMAIL_PROVIDER: ${EMAIL_PROVIDER:-development}
+      AWS_REGION: ${AWS_REGION:-ap-south-1}
+      AWS_SES_CONFIGURATION_SET: ${AWS_SES_CONFIGURATION_SET:-}
+      AWS_S3_BUCKET: ${AWS_S3_BUCKET:-}
+      EMAIL_FROM_NAME: ${EMAIL_FROM_NAME:-Repus}
+      EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:-hello@example.com}
+      PLATFORM_ADMIN_EMAILS: ${PLATFORM_ADMIN_EMAILS:-}
+      PLATFORM_DAILY_SEND_LIMIT: ${PLATFORM_DAILY_SEND_LIMIT:-2500}
+      PLATFORM_MONTHLY_SEND_LIMIT: ${PLATFORM_MONTHLY_SEND_LIMIT:-75000}
+      PLATFORM_TIMEZONE: ${PLATFORM_TIMEZONE:-Asia/Kolkata}
+      REPUS_REPUTATION_MINIMUM_SAMPLE: ${REPUS_REPUTATION_MINIMUM_SAMPLE:-20}
+      REPUS_MAX_BOUNCE_RATE: ${REPUS_MAX_BOUNCE_RATE:-0.05}
+      REPUS_MAX_COMPLAINT_RATE: ${REPUS_MAX_COMPLAINT_RATE:-0.001}
+      DEFAULT_TENANT_DAILY_LIMIT: ${DEFAULT_TENANT_DAILY_LIMIT:-500}
+      DEFAULT_TENANT_MONTHLY_LIMIT: ${DEFAULT_TENANT_MONTHLY_LIMIT:-15000}
+      IMPORT_STAGING_DIR: /data/repus-imports
+      PORT: 4000
+      TRUST_PROXY_HOPS: ${TRUST_PROXY_HOPS:-0}
+    ports:
+      - "127.0.0.1:4000:4000"
+    healthcheck:
+      test: ["CMD", "node", "tools/service-readiness.cjs", "api"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+    volumes:
+      - repus_imports:/data/repus-imports
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+  web:
+    init: true
+    build:
+      context: .
+      target: web
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:4000}
+    restart: unless-stopped
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:4000}
+    ports:
+      - "127.0.0.1:${WEB_PORT:-3000}:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "tools/service-readiness.cjs", "web"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+  worker:
+    init: true
+    build:
+      context: .
+      target: worker
+    restart: unless-stopped
+    stop_grace_period: 2m
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      WORKER_DATABASE_URL: postgresql://repus_worker:${WORKER_DB_PASSWORD:-repus_worker_dev_password}@postgres:5432/repus?schema=public
+      REDIS_URL: redis://redis:6379
+      NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
+      API_URL: ${API_URL:-http://localhost:4000}
+      PUBLIC_MEDIA_URL: ${PUBLIC_MEDIA_URL:-http://localhost:4000}
+      TRACKING_BASE_URL: ${TRACKING_BASE_URL:-http://localhost:4000}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      EMAIL_PROVIDER: ${EMAIL_PROVIDER:-development}
+      EMAIL_MAX_SEND_RATE_PER_SECOND: ${EMAIL_MAX_SEND_RATE_PER_SECOND:-1}
+      AWS_REGION: ${AWS_REGION:-ap-south-1}
+      AWS_SES_CONFIGURATION_SET: ${AWS_SES_CONFIGURATION_SET:-}
+      AWS_S3_BUCKET: ${AWS_S3_BUCKET:-}
+      EMAIL_FROM_NAME: ${EMAIL_FROM_NAME:-Repus}
+      EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:-hello@example.com}
+      PLATFORM_DAILY_SEND_LIMIT: ${PLATFORM_DAILY_SEND_LIMIT:-2500}
+      PLATFORM_MONTHLY_SEND_LIMIT: ${PLATFORM_MONTHLY_SEND_LIMIT:-75000}
+      PLATFORM_TIMEZONE: ${PLATFORM_TIMEZONE:-Asia/Kolkata}
+      IMPORT_STAGING_DIR: /data/repus-imports
+    volumes:
+      - repus_imports:/data/repus-imports
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "tools/run-with-env.cjs", "--worker-db", "node", "tools/service-readiness.cjs", "worker"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+  event-worker:
+    init: true
+    build:
+      context: .
+      target: event-worker
+    restart: unless-stopped
+    stop_grace_period: 2m
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      EMAIL_PROVIDER: ${EMAIL_PROVIDER:-development}
+      WORKER_DATABASE_URL: postgresql://repus_worker:${WORKER_DB_PASSWORD:-repus_worker_dev_password}@postgres:5432/repus?schema=public
+      REDIS_URL: redis://redis:6379
+      AWS_REGION: ${AWS_REGION:-ap-south-1}
+      AWS_SES_SQS_URL: ${AWS_SES_SQS_URL:-}
+      AWS_SES_SNS_TOPIC_ARN: ${AWS_SES_SNS_TOPIC_ARN:-}
+      PLATFORM_TIMEZONE: ${PLATFORM_TIMEZONE:-Asia/Kolkata}
+      REPUS_REPUTATION_MINIMUM_SAMPLE: ${REPUS_REPUTATION_MINIMUM_SAMPLE:-20}
+      REPUS_MAX_BOUNCE_RATE: ${REPUS_MAX_BOUNCE_RATE:-0.05}
+      REPUS_MAX_COMPLAINT_RATE: ${REPUS_MAX_COMPLAINT_RATE:-0.001}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "tools/run-with-env.cjs", "--worker-db", "node", "tools/service-readiness.cjs", "worker"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: repus
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-repus_dev_password}
+      POSTGRES_DB: repus
+      API_DB_PASSWORD: ${API_DB_PASSWORD:-repus_api_dev_password}
+      WORKER_DB_PASSWORD: ${WORKER_DB_PASSWORD:-repus_worker_dev_password}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/postgres/01-application-roles.sql:/docker-entrypoint-initdb.d/01-application-roles.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U repus -d repus"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+volumes:
+  postgres_data:
+  postgres_backups:
+  redis_data:
+  repus_imports:

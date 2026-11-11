@@ -1,0 +1,601 @@
+generator client {
+  provider = "prisma-client"
+  output = "../generated/prisma"
+  moduleFormat = "cjs"
+  importFileExtension = "js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  OWNER
+  ADMIN
+  MARKETER
+  VIEWER
+}
+enum ApiKeyRole {
+  MARKETER
+  VIEWER
+}
+enum UserStatus {
+  PENDING
+  ACTIVE
+  DISABLED
+}
+enum MembershipStatus {
+  PENDING
+  ACTIVE
+  DISABLED
+}
+enum ContactStatus {
+  SUBSCRIBED
+  UNSUBSCRIBED
+  BOUNCED
+  COMPLAINED
+  PENDING_CONFIRMATION
+}
+enum CampaignStatus {
+  DRAFT
+  SCHEDULED
+  PREPARING
+  QUEUED
+  SENDING
+  PAUSED
+  COMPLETED
+  CANCELLED
+  FAILED
+}
+enum RecipientStatus {
+  PENDING
+  QUEUED
+  SENDING
+  SENT
+  DELIVERED
+  BOUNCED
+  COMPLAINED
+  FAILED
+  SUPPRESSED
+}
+enum ImportStatus {
+  UPLOADED
+  PROCESSING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+enum CustomFieldType {
+  TEXT
+  NUMBER
+  DATE
+  BOOLEAN
+}
+
+model Tenant {
+  id String @id @default(uuid()) @db.Uuid
+  name String
+  slug String @unique
+  plan String @default("free")
+  status String @default("active")
+  timezone String @default("Asia/Kolkata")
+  doubleOptInEnabled Boolean @default(false) @map("double_opt_in_enabled")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  users User[] @relation("UserHomeTenant")
+  memberships OrganizationMembership[]
+  sessions Session[] @relation("SessionTenant")
+  oneTimeTokens OneTimeToken[]
+  apiKeys ApiKey[]
+  contacts Contact[]
+  customFieldDefinitions CustomFieldDefinition[]
+  lists ContactList[]
+  templates Template[]
+  campaigns Campaign[]
+  suppressions Suppression[]
+  sendingLimit TenantSendingLimit?
+  dailyUsage DailyUsage[]
+  domains SendingDomain[]
+  imports ImportJob[]
+  imageAssets ImageAsset[]
+  auditLogs AuditLog[]
+  billingSubscriptions BillingSubscription[]
+  @@map("tenants")
+}
+
+model User {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  name String
+  email String
+  normalizedEmail String @map("normalized_email")
+  passwordHash String @map("password_hash")
+  role Role @default(OWNER)
+  status UserStatus @default(PENDING)
+  emailVerifiedAt DateTime? @map("email_verified_at") @db.Timestamptz
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  tenant Tenant @relation("UserHomeTenant", fields: [tenantId], references: [id], onDelete: Cascade)
+  memberships OrganizationMembership[]
+  sessions Session[] @relation("SessionUser")
+  oneTimeTokens OneTimeToken[]
+  auditLogs AuditLog[]
+  createdApiKeys ApiKey[]
+  @@unique([tenantId, id])
+  @@unique([normalizedEmail])
+  @@index([tenantId])
+  @@map("users")
+}
+
+model Session {
+  id String @id @default(uuid()) @db.Uuid
+  userId String @map("user_id") @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  tokenHash String @unique @map("token_hash")
+  expiresAt DateTime @map("expires_at") @db.Timestamptz
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  user User @relation("SessionUser", fields: [userId], references: [id], onDelete: Cascade)
+  tenant Tenant @relation("SessionTenant", fields: [tenantId], references: [id], onDelete: Cascade)
+  membership OrganizationMembership @relation("SessionMembership", fields: [tenantId,userId], references: [tenantId,userId], onDelete: Cascade)
+  @@index([expiresAt])
+  @@index([tenantId])
+  @@map("sessions")
+}
+
+model ApiKey {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  createdByUserId String @map("created_by_user_id") @db.Uuid
+  name String
+  keyHash String @unique @map("key_hash")
+  role ApiKeyRole @default(MARKETER)
+  lastUsedAt DateTime? @map("last_used_at") @db.Timestamptz
+  expiresAt DateTime? @map("expires_at") @db.Timestamptz
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  createdBy User @relation(fields: [createdByUserId], references: [id], onDelete: Cascade)
+  @@unique([tenantId, id])
+  @@index([tenantId, revokedAt, createdAt], map: "api_keys_tenant_revoked_created_idx")
+  @@map("api_keys")
+}
+
+model OneTimeToken {
+  id String @id @default(uuid()) @db.Uuid
+  userId String @map("user_id") @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  tokenHash String @unique @map("token_hash")
+  purpose String
+  tokenEncrypted String? @map("token_encrypted") @db.Text
+  deliveryStatus String @default("PENDING") @map("delivery_status")
+  deliveryAttempts Int @default(0) @map("delivery_attempts")
+  deliveryNextAttemptAt DateTime? @map("delivery_next_attempt_at") @db.Timestamptz
+  deliveryStartedAt DateTime? @map("delivery_started_at") @db.Timestamptz
+  deliverySentAt DateTime? @map("delivery_sent_at") @db.Timestamptz
+  deliveryMessageId String? @map("delivery_message_id")
+  expiresAt DateTime @map("expires_at") @db.Timestamptz
+  usedAt DateTime? @map("used_at") @db.Timestamptz
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  @@index([userId, purpose, expiresAt])
+  @@map("one_time_tokens")
+}
+
+model OrganizationMembership {
+  tenantId String @map("tenant_id") @db.Uuid
+  userId String @map("user_id") @db.Uuid
+  role Role @default(MARKETER)
+  status MembershipStatus @default(ACTIVE)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessions Session[] @relation("SessionMembership")
+  @@id([tenantId, userId])
+  @@index([userId, status])
+  @@map("organization_memberships")
+}
+
+model Contact {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  email String
+  normalizedEmail String @map("normalized_email")
+  firstName String? @map("first_name")
+  lastName String? @map("last_name")
+  status ContactStatus @default(PENDING_CONFIRMATION)
+  consentSource String? @map("consent_source")
+  consentAt DateTime? @map("consent_at") @db.Timestamptz
+  customFields Json @default("{}") @map("custom_fields")
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  memberships ListContact[]
+  confirmationTokens ContactConfirmationToken[]
+  recipients CampaignRecipient[]
+  @@unique([tenantId, normalizedEmail])
+  @@unique([tenantId, id])
+  @@index([tenantId, status])
+  @@index([tenantId, email])
+  @@index([tenantId, deletedAt], map: "contacts_tenant_deleted_at_idx")
+  @@map("contacts")
+}
+
+model ContactConfirmationToken {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  contactId String @map("contact_id") @db.Uuid
+  tokenHash String @unique @map("token_hash")
+  tokenEncrypted String @map("token_encrypted") @db.Text
+  expiresAt DateTime @map("expires_at") @db.Timestamptz
+  confirmedAt DateTime? @map("confirmed_at") @db.Timestamptz
+  emailQueuedAt DateTime? @map("email_queued_at") @db.Timestamptz
+  emailQueueAttempts Int @default(0) @map("email_queue_attempts")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  contact Contact @relation(fields: [tenantId,contactId], references: [tenantId,id], onDelete: Cascade)
+  @@index([tenantId,contactId,expiresAt])
+  @@map("contact_confirmation_tokens")
+}
+
+model CustomFieldDefinition {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  key String
+  label String
+  type CustomFieldType @default(TEXT)
+  required Boolean @default(false)
+  archived Boolean @default(false)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  @@unique([tenantId, id])
+  @@unique([tenantId, key])
+  @@index([tenantId, label], map: "custom_field_definitions_tenant_label_idx")
+  @@map("custom_field_definitions")
+}
+
+model ContactList {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  name String
+  description String?
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  contacts ListContact[]
+  campaigns Campaign[]
+  @@unique([tenantId, id])
+  @@unique([tenantId, name])
+  @@map("contact_lists")
+}
+
+model ListContact {
+  tenantId String @map("tenant_id") @db.Uuid
+  listId String @map("list_id") @db.Uuid
+  contactId String @map("contact_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  list ContactList @relation(fields: [tenantId, listId], references: [tenantId, id], onDelete: Cascade)
+  contact Contact @relation(fields: [tenantId, contactId], references: [tenantId, id], onDelete: Cascade)
+  @@id([tenantId, listId, contactId])
+  @@map("list_contacts")
+}
+
+model Template {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  name String
+  subject String?
+  htmlContent String @map("html_content") @db.Text
+  textContent String? @map("text_content") @db.Text
+  editorJson Json? @map("editor_json")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  campaigns Campaign[]
+  @@unique([tenantId, id])
+  @@map("templates")
+}
+
+model Campaign {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  name String
+  subject String?
+  previewText String? @map("preview_text")
+  fromName String? @map("from_name")
+  fromEmail String? @map("from_email")
+  replyTo String? @map("reply_to")
+  listId String? @map("list_id") @db.Uuid
+  templateId String? @map("template_id") @db.Uuid
+  htmlContent String? @map("html_content") @db.Text
+  textContent String? @map("text_content") @db.Text
+  editorJson Json? @map("editor_json")
+  status CampaignStatus @default(DRAFT)
+  scheduledAt DateTime? @map("scheduled_at") @db.Timestamptz
+  quotaDate DateTime? @map("quota_date") @db.Date
+  startedAt DateTime? @map("started_at") @db.Timestamptz
+  completedAt DateTime? @map("completed_at") @db.Timestamptz
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  list ContactList? @relation(fields: [tenantId, listId], references: [tenantId, id])
+  template Template? @relation(fields: [tenantId, templateId], references: [tenantId, id])
+  recipients CampaignRecipient[]
+  @@unique([tenantId, id])
+  @@index([tenantId, status])
+  @@index([tenantId, createdAt(sort: Desc), id(sort: Desc)], map: "campaigns_tenant_created_id_idx")
+  @@map("campaigns")
+}
+
+model CampaignRecipient {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  campaignId String @map("campaign_id") @db.Uuid
+  contactId String @map("contact_id") @db.Uuid
+  email String
+  status RecipientStatus @default(PENDING)
+  providerMessageId String? @map("provider_message_id")
+  providerAcceptedAt DateTime? @map("provider_accepted_at") @db.Timestamptz
+  sendStartedAt DateTime? @map("send_started_at") @db.Timestamptz
+  sentAt DateTime? @map("sent_at") @db.Timestamptz
+  deliveredAt DateTime? @map("delivered_at") @db.Timestamptz
+  quotaReserved Boolean @default(true) @map("quota_reserved")
+  quotaDate DateTime @map("quota_date") @db.Date
+  unsubscribeTokenHash String? @unique @map("unsubscribe_token_hash")
+  unsubscribeTokenEncrypted String? @map("unsubscribe_token_encrypted") @db.Text
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  campaign Campaign @relation(fields: [tenantId, campaignId], references: [tenantId, id], onDelete: Cascade)
+  contact Contact @relation(fields: [tenantId, contactId], references: [tenantId, id])
+  events EmailEvent[]
+  @@unique([campaignId, contactId])
+  @@unique([tenantId, id])
+  @@index([tenantId, status])
+  @@index([tenantId, campaignId, status, id], map: "campaign_recipients_campaign_status_id_idx")
+  @@index([tenantId, campaignId, status, sendStartedAt], map: "campaign_recipients_send_review_idx")
+  @@index([tenantId, quotaDate], map: "campaign_recipients_quota_date_idx")
+  @@map("campaign_recipients")
+}
+
+model EmailEvent {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  recipientId String @map("recipient_id") @db.Uuid
+  eventType String @map("event_type")
+  eventKey String? @map("event_key")
+  url String?
+  eventData Json @default("{}") @map("event_data")
+  occurredAt DateTime @default(now()) @map("occurred_at") @db.Timestamptz
+  recipient CampaignRecipient @relation(fields: [tenantId, recipientId], references: [tenantId, id], onDelete: Cascade)
+  @@unique([tenantId, eventKey])
+  @@index([tenantId, recipientId, eventType])
+  @@index([tenantId, eventType, occurredAt], map: "email_events_tenant_type_occurred_idx")
+  @@map("email_events")
+}
+
+model WebhookDelivery {
+  id String @id @default(uuid()) @db.Uuid
+  provider String
+  providerEventId String @unique @map("provider_event_id")
+  payload Json
+  status String @default("received")
+  attempts Int @default(0)
+  processedAt DateTime? @map("processed_at") @db.Timestamptz
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  @@index([status,createdAt])
+  @@map("webhook_deliveries")
+}
+
+model Suppression {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  email String
+  normalizedEmail String @map("normalized_email")
+  reason String
+  source String
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  @@unique([tenantId, normalizedEmail])
+  @@map("suppressions")
+}
+
+model Unsubscribe {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  contactId String? @map("contact_id") @db.Uuid
+  email String
+  reason String?
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  @@index([tenantId, email])
+  @@map("unsubscribes")
+}
+
+model TenantSendingLimit {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @unique @map("tenant_id") @db.Uuid
+  dailyLimit Int @default(500) @map("daily_limit")
+  monthlyLimit Int @default(15000) @map("monthly_limit")
+  contactLimit Int @default(10000) @map("contact_limit")
+  mediaStorageLimitBytes Int @default(104857600) @map("media_storage_limit_bytes")
+  quotaOverrides Json @default("[]") @map("quota_overrides") @db.JsonB
+  enabled Boolean @default(true)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  @@map("tenant_sending_limits")
+}
+
+model DailyUsage {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  usageDate DateTime @map("usage_date") @db.Date
+  sentCount Int @default(0) @map("sent_count")
+  reservedCount Int @default(0) @map("reserved_count")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  @@unique([tenantId, usageDate])
+  @@map("daily_usage")
+}
+
+// Platform-wide quota ledger. Deliberately has no tenant_id or RLS policy.
+model PlatformDailyUsage {
+  id String @id @default(uuid()) @db.Uuid
+  usageDate DateTime @unique @map("usage_date") @db.Date
+  sentCount Int @default(0) @map("sent_count")
+  reservedCount Int @default(0) @map("reserved_count")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  @@map("platform_daily_usage")
+}
+
+model PlatformControl {
+  id Int @id @default(1)
+  sendingPaused Boolean @default(false) @map("sending_paused")
+  dailySendLimit Int? @map("daily_send_limit")
+  monthlySendLimit Int? @map("monthly_send_limit")
+  defaultTenantDailyLimit Int? @map("default_tenant_daily_limit")
+  defaultTenantMonthlyLimit Int? @map("default_tenant_monthly_limit")
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  updatedByUserId String? @map("updated_by_user_id") @db.Uuid
+  @@map("platform_controls")
+}
+
+model PlatformQueueHealthSample {
+  id String @id @default(uuid()) @db.Uuid
+  checkedAt DateTime @default(now()) @map("checked_at") @db.Timestamptz
+  queues Json
+  failedJobCount Int @default(0) @map("failed_job_count")
+  healthCheckFailures Int @default(0) @map("health_check_failures")
+  @@index([checkedAt(sort: Desc)])
+  @@map("platform_queue_health_samples")
+}
+
+model SendingDomain {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  domain String
+  verificationStatus String @default("pending") @map("verification_status")
+  dkimStatus String @default("pending") @map("dkim_status")
+  spfStatus String @default("unknown") @map("spf_status")
+  dmarcStatus String @default("unknown") @map("dmarc_status")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  @@unique([tenantId, domain])
+  @@map("sending_domains")
+}
+
+model ImageAsset {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  objectKey String @unique @map("object_key")
+  contentType String @map("content_type")
+  byteSize Int @map("byte_size")
+  tokenHash String @unique @map("token_hash")
+  tokenEncrypted String @map("token_encrypted") @db.Text
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  @@unique([tenantId,id])
+  @@index([tenantId,createdAt])
+  @@map("image_assets")
+}
+
+model ImportJob {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  fileKey String @map("file_key")
+  status ImportStatus @default(UPLOADED)
+  totalRows Int @default(0) @map("total_rows")
+  importedRows Int @default(0) @map("imported_rows")
+  duplicateRows Int @default(0) @map("duplicate_rows")
+  rejectedRows Int @default(0) @map("rejected_rows")
+  suppressedRows Int @default(0) @map("suppressed_rows")
+  processedRows Int @default(0) @map("processed_rows")
+  attempt Int @default(0)
+  csvHeaders Json? @map("csv_headers")
+  fieldMapping Json? @map("field_mapping")
+  destinationListId String? @map("destination_list_id") @db.Uuid
+  consentSource String? @map("consent_source")
+  consentAt DateTime? @map("consent_at") @db.Timestamptz
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  completedAt DateTime? @map("completed_at") @db.Timestamptz
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  errors ImportError[]
+  stagingDeletedAt DateTime? @map("staging_deleted_at") @db.Timestamptz
+  @@unique([tenantId, id])
+  @@map("import_jobs")
+}
+
+model ImportError {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  importJobId String @map("import_job_id") @db.Uuid
+  rowNumber Int @map("row_number")
+  email String?
+  reason String
+  rowData Json @map("row_data")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  job ImportJob @relation(fields: [tenantId, importJobId], references: [tenantId, id], onDelete: Cascade)
+  @@unique([importJobId, rowNumber])
+  @@index([tenantId, importJobId, rowNumber])
+  @@map("import_errors")
+}
+
+model AuditLog {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  userId String? @map("user_id") @db.Uuid
+  action String
+  entityType String @map("entity_type")
+  entityId String? @map("entity_id") @db.Uuid
+  metadata Json @default("{}")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+  @@index([tenantId, createdAt])
+  @@map("audit_logs")
+}
+
+model PlatformAuditLog {
+  id String @id @default(uuid()) @db.Uuid
+  actorUserId String @map("actor_user_id") @db.Uuid
+  actorEmail String @map("actor_email")
+  action String
+  tenantId String? @map("tenant_id") @db.Uuid
+  metadata Json @default("{}")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  @@index([createdAt])
+  @@index([tenantId, createdAt])
+  @@map("platform_audit_logs")
+}
+
+model AbuseReport {
+  id String @id @default(uuid()) @db.Uuid
+  senderAddress String @map("sender_address") @db.VarChar(320)
+  campaignReference String? @map("campaign_reference") @db.VarChar(160)
+  messageId String? @map("message_id") @db.VarChar(320)
+  reporterEmail String? @map("reporter_email") @db.VarChar(320)
+  category String @db.VarChar(40)
+  details String @db.VarChar(3000)
+  status String @default("open") @db.VarChar(20)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  @@index([status,createdAt])
+  @@map("abuse_reports")
+}
+
+model BillingSubscription {
+  id String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  provider String @db.VarChar(40)
+  providerCustomerId String? @map("provider_customer_id") @db.VarChar(200)
+  providerSubscriptionId String? @map("provider_subscription_id") @db.VarChar(200)
+  plan String @db.VarChar(80)
+  status String @db.VarChar(40)
+  currentPeriodStart DateTime? @map("current_period_start") @db.Timestamptz
+  currentPeriodEnd DateTime? @map("current_period_end") @db.Timestamptz
+  cancelAtPeriodEnd Boolean @default(false) @map("cancel_at_period_end")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  @@unique([provider, providerSubscriptionId], map: "billing_subscriptions_provider_subscription_key")
+  @@index([tenantId, status, updatedAt])
+  @@map("billing_subscriptions")
+}

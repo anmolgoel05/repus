@@ -1,0 +1,87 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Repus private CSV staging and campaign image storage with separate API and worker policies.",
+  "Parameters": {
+    "ResourcePrefix": {
+      "Type": "String",
+      "Default": "repus-prod",
+      "AllowedPattern": "^[A-Za-z0-9_-]{1,40}$"
+    }
+  },
+  "Resources": {
+    "PrivateObjects": {
+      "Type": "AWS::S3::Bucket",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "IgnorePublicAcls": true,
+          "BlockPublicPolicy": true,
+          "RestrictPublicBuckets": true
+        },
+        "OwnershipControls": {"Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]},
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [{"ServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]
+        },
+        "LifecycleConfiguration": {
+          "Rules": [{"Id": "AbortAbandonedMultipartUploads", "Status": "Enabled", "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 1}}]
+        }
+      }
+    },
+    "PrivateObjectsPolicy": {
+      "Type": "AWS::S3::BucketPolicy",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "Bucket": {"Ref": "PrivateObjects"},
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [{
+            "Sid": "DenyInsecureTransport",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:*",
+            "Resource": [{"Fn::GetAtt": ["PrivateObjects", "Arn"]}, {"Fn::Sub": "${PrivateObjects.Arn}/*"}],
+            "Condition": {"Bool": {"aws:SecureTransport": "false"}}
+          }]
+        }
+      }
+    },
+    "ApiStoragePolicy": {
+      "Type": "AWS::IAM::ManagedPolicy",
+      "Properties": {
+        "ManagedPolicyName": {"Fn::Sub": "${ResourcePrefix}-${AWS::Region}-storage-api"},
+        "Description": "API private uploads, previews, media streaming and explicit object cleanup. No bucket administration.",
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [{
+            "Sid": "ManagePrivateApplicationObjects",
+            "Effect": "Allow",
+            "Action": ["s3:PutObject", "s3:AbortMultipartUpload", "s3:GetObject", "s3:DeleteObject"],
+            "Resource": {"Fn::Sub": "${PrivateObjects.Arn}/*"}
+          }]
+        }
+      }
+    },
+    "WorkerStoragePolicy": {
+      "Type": "AWS::IAM::ManagedPolicy",
+      "Properties": {
+        "ManagedPolicyName": {"Fn::Sub": "${ResourcePrefix}-${AWS::Region}-storage-worker"},
+        "Description": "Sending/import worker reads and cleanup within the application bucket. No upload or bucket administration.",
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {"Sid": "ReadAndCleanPrivateObjects", "Effect": "Allow", "Action": ["s3:GetObject", "s3:DeleteObject"], "Resource": {"Fn::Sub": "${PrivateObjects.Arn}/*"}},
+            {"Sid": "ListForBoundedOrphanSweep", "Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": {"Fn::GetAtt": ["PrivateObjects", "Arn"]}}
+          ]
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "PrivateBucketName": {"Description": "Set AWS_S3_BUCKET on the API and sending/import worker.", "Value": {"Ref": "PrivateObjects"}},
+    "ApiStoragePolicyArn": {"Description": "Attach only to the API role.", "Value": {"Ref": "ApiStoragePolicy"}},
+    "WorkerStoragePolicyArn": {"Description": "Attach only to the sending/import worker role; the event worker and web do not need S3 access.", "Value": {"Ref": "WorkerStoragePolicy"}}
+  }
+}

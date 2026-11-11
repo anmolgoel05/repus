@@ -1,0 +1,451 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Repus SES sending identity, configuration set, and authenticated SNS to SQS event pipeline.
+Parameters:
+  SendingDomain:
+    Type: String
+    Description: Verified sending domain, for example mail.example.com.
+    AllowedPattern: '^[A-Za-z0-9.-]+$'
+  ConfigurationSetName:
+    Type: String
+    Default: repus-production
+    AllowedPattern: '^[A-Za-z0-9_-]{1,64}$'
+  SendingIdentityArns:
+    Type: CommaDelimitedList
+    Description: Exact SES identity ARNs the API and email worker may send from or inspect. Include the SendingDomain identity and each pre-provisioned tenant identity.
+    AllowedPattern: '^arn:[A-Za-z0-9-]+:ses:[A-Za-z0-9-]+:[0-9]{12}:identity/[A-Za-z0-9._@+-]+$'
+  ResourcePrefix:
+    Type: String
+    Default: repus-prod
+    AllowedPattern: '^[A-Za-z0-9_-]{1,40}$'
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: Optional on-call email for SES event backlog and dead-letter alarms; confirm the SNS subscription after deployment.
+  BounceRateAlarmThreshold:
+    Type: Number
+    Default: 0.04
+    MinValue: 0.001
+    MaxValue: 1
+    Description: Alarm threshold for the AWS/SES Reputation.BounceRate account metric (fraction, not percent).
+  ComplaintRateAlarmThreshold:
+    Type: Number
+    Default: 0.0008
+    MinValue: 0.00001
+    MaxValue: 1
+    Description: Alarm threshold for the AWS/SES Reputation.ComplaintRate account metric (fraction, not percent).
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+Resources:
+  RepusNotificationsKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: Encrypt Repus SES notifications and operations alarms.
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableAccountKeyAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowConfiguredSesEventsEncryption
+            Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnEquals:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:configuration-set/${ConfigurationSetName}'
+          - Sid: AllowScopedAlarmEncryption
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ResourcePrefix}-*'
+  RepusNotificationsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ResourcePrefix}-notifications'
+      TargetKeyId: !Ref RepusNotificationsKey
+  SesConfigurationSet:
+    Type: AWS::SES::ConfigurationSet
+    Properties:
+      Name: !Ref ConfigurationSetName
+      ReputationOptions:
+        ReputationMetricsEnabled: true
+  SesSendingIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref SendingDomain
+      ConfigurationSetAttributes:
+        ConfigurationSetName: !Ref SesConfigurationSet
+      DkimSigningAttributes:
+        NextSigningKeyLength: RSA_2048_BIT
+  SesEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ResourcePrefix}-ses-events'
+      KmsMasterKeyId: !GetAtt RepusNotificationsKey.Arn
+  SesEventsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref SesEventsTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSesConfigurationSetPublish
+            Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref SesEventsTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnEquals:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:configuration-set/${ConfigurationSetName}'
+  SesEventsDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ResourcePrefix}-ses-events-dlq'
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+  SesEventsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ResourcePrefix}-ses-events'
+      MessageRetentionPeriod: 1209600
+      VisibilityTimeout: 120
+      ReceiveMessageWaitTimeSeconds: 20
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt SesEventsDeadLetterQueue.Arn
+        maxReceiveCount: 5
+  SesEventsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref SesEventsQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowOnlyRepusSesTopic
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt SesEventsQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref SesEventsTopic
+  SesEventsSubscription:
+    Type: AWS::SNS::Subscription
+    DependsOn: SesEventsQueuePolicy
+    Properties:
+      TopicArn: !Ref SesEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt SesEventsQueue.Arn
+      RawMessageDelivery: false
+  SesAllEventsDestination:
+    Type: AWS::SES::ConfigurationSetEventDestination
+    DependsOn:
+      - SesEventsTopicPolicy
+      - SesEventsSubscription
+    Properties:
+      ConfigurationSetName: !Ref SesConfigurationSet
+      EventDestination:
+        Name: repus-events
+        Enabled: true
+        MatchingEventTypes:
+          - SEND
+          - REJECT
+          - BOUNCE
+          - COMPLAINT
+          - DELIVERY
+          - DELIVERY_DELAY
+          - SUBSCRIPTION
+          - RENDERING_FAILURE
+        SnsDestination:
+          TopicARN: !Ref SesEventsTopic
+  RepusSesApplicationPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${ResourcePrefix}-${AWS::Region}-ses-app'
+      Description: Email worker sending limited to explicitly configured identity ARNs, plus account quota reads.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: SendFromConfiguredDomain
+            Effect: Allow
+            Action:
+              - ses:SendEmail
+            Resource: !Ref SendingIdentityArns
+          - Sid: ReadSesAccountQuota
+            Effect: Allow
+            Action:
+              - ses:GetAccount
+            Resource: '*'
+  RepusApiSesReadPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${ResourcePrefix}-${AWS::Region}-ses-api-read'
+      Description: API identity status reads limited to explicitly configured identity ARNs, plus account quota reads. No send permission.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ReadConfiguredIdentity
+            Effect: Allow
+            Action:
+              - ses:GetEmailIdentity
+            Resource: !Ref SendingIdentityArns
+          - Sid: ReadSesAccountQuota
+            Effect: Allow
+            Action:
+              - ses:GetAccount
+            Resource: '*'
+  RepusEventWorkerPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${ResourcePrefix}-${AWS::Region}-ses-events'
+      Description: Consume only the Repus SES event queue.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ConsumeRepusSesEvents
+            Effect: Allow
+            Action:
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+              - sqs:GetQueueAttributes
+              - sqs:ChangeMessageVisibility
+            Resource: !GetAtt SesEventsQueue.Arn
+  RepusOperationsAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ResourcePrefix}-operations-alerts'
+      KmsMasterKeyId: !GetAtt RepusNotificationsKey.Arn
+  RepusOperationsAlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref RepusOperationsAlertTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowScopedCloudWatchAlarms
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref RepusOperationsAlertTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ResourcePrefix}-*'
+  RepusOperationsAlertEmail:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref RepusOperationsAlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+  SesEventQueueBacklogAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-ses-event-backlog'
+      AlarmDescription: SES provider events have waited more than five minutes for processing.
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt SesEventsQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 300
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref RepusOperationsAlertTopic]
+  SesEventPollHeartbeatAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-ses-event-poll-missing'
+      AlarmDescription: No successful Repus SQS poll heartbeat was reported for the SES event queue.
+      Namespace: Repus/Events
+      MetricName: SqsPollHeartbeat
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt SesEventsQueue.QueueName
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref RepusOperationsAlertTopic]
+  SesEventDeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-ses-event-dead-letter'
+      AlarmDescription: One or more SES provider events reached the dead-letter queue.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt SesEventsDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref RepusOperationsAlertTopic]
+  SesReputationBounceAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-ses-bounce-reputation'
+      AlarmDescription: SES account hard-bounce rate crossed the configured warning threshold.
+      Namespace: AWS/SES
+      MetricName: Reputation.BounceRate
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: !Ref BounceRateAlarmThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref RepusOperationsAlertTopic]
+  SesReputationComplaintAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-ses-complaint-reputation'
+      AlarmDescription: SES account complaint rate crossed the configured warning threshold.
+      Namespace: AWS/SES
+      MetricName: Reputation.ComplaintRate
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: !Ref ComplaintRateAlarmThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref RepusOperationsAlertTopic]
+  RepusBullMqFailedJobsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-bullmq-failed-jobs'
+      AlarmDescription: Aggregate BullMQ failed jobs exceeded the initial threshold; inspect the admin health dashboard and worker logs.
+      Namespace: Repus/Queues
+      MetricName: TotalFailedJobs
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref RepusOperationsAlertTopic]
+  RepusWorkerMetricsHeartbeatAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-worker-metrics-missing'
+      AlarmDescription: The production worker has not emitted its queue health heartbeat within five minutes.
+      Namespace: Repus/Queues
+      MetricName: WorkerMetricsHeartbeat
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref RepusOperationsAlertTopic]
+  RepusQueueHealthCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-queue-health-check-failures'
+      AlarmDescription: One or more BullMQ queue health queries failed; inspect Redis and worker connectivity.
+      Namespace: Repus/Queues
+      MetricName: QueueHealthCheckFailures
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref RepusOperationsAlertTopic]
+  RepusApiServerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-api-server-errors'
+      AlarmDescription: Repus API emitted one or more sanitized server-error metrics.
+      Namespace: Repus/API
+      MetricName: ServerErrors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref RepusOperationsAlertTopic]
+Outputs:
+  SendingIdentityArn:
+    Description: Add this exact ARN to SendingIdentityArns when deploying or updating the stack.
+    Value: !Sub 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${SendingDomain}'
+  SesConfigurationSetName:
+    Description: Set AWS_SES_CONFIGURATION_SET to this value.
+    Value: !Ref SesConfigurationSet
+  SesEventsTopicArn:
+    Description: Set AWS_SES_SNS_TOPIC_ARN to this value.
+    Value: !Ref SesEventsTopic
+  SesEventsQueueUrl:
+    Description: Set AWS_SES_SQS_URL to this value.
+    Value: !Ref SesEventsQueue
+  SesEventsDeadLetterQueueUrl:
+    Value: !Ref SesEventsDeadLetterQueue
+  OperationsAlertTopicArn:
+    Description: Configure additional incident targets on this operations alert topic.
+    Value: !Ref RepusOperationsAlertTopic
+  EmailWorkerPolicyArn:
+    Description: Attach only to the email worker role. Send access uses only SendingIdentityArns; runtime identity creation is not permitted.
+    Value: !Ref RepusSesApplicationPolicy
+  ApiSesReadPolicyArn:
+    Description: Attach only to the API role. Explicit identity status and account quota reads; no sending or identity creation.
+    Value: !Ref RepusApiSesReadPolicy
+  EventWorkerPolicyArn:
+    Description: Attach only to the event-worker role.
+    Value: !Ref RepusEventWorkerPolicy
+  SendingDomain:
+    Value: !Ref SendingDomain
+  DkimRecord1Name:
+    Value: !GetAtt SesSendingIdentity.DkimDNSTokenName1
+  DkimRecord1Value:
+    Value: !GetAtt SesSendingIdentity.DkimDNSTokenValue1
+  DkimRecord2Name:
+    Value: !GetAtt SesSendingIdentity.DkimDNSTokenName2
+  DkimRecord2Value:
+    Value: !GetAtt SesSendingIdentity.DkimDNSTokenValue2
+  DkimRecord3Name:
+    Value: !GetAtt SesSendingIdentity.DkimDNSTokenName3
+  DkimRecord3Value:
+    Value: !GetAtt SesSendingIdentity.DkimDNSTokenValue3

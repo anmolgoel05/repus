@@ -1,0 +1,219 @@
+name: Verify Repus
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  full-stack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: repus
+          POSTGRES_DB: repus
+          POSTGRES_PASSWORD: repus_ci_owner_password
+        ports: ['5432:5432']
+        options: --health-cmd "pg_isready -U repus -d repus" --health-interval 5s --health-timeout 5s --health-retries 12
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      # Test credentials are confined to disposable service containers.
+      NODE_ENV: development
+      DATABASE_URL: postgresql://repus_api:repus_ci_api_password@127.0.0.1:5432/repus?schema=public
+      MIGRATION_DATABASE_URL: postgresql://repus:repus_ci_owner_password@127.0.0.1:5432/repus?schema=public
+      WORKER_DATABASE_URL: postgresql://repus_worker:repus_ci_worker_password@127.0.0.1:5432/repus?schema=public
+      RLS_TEST_DATABASE_URL: postgresql://repus_api:repus_ci_api_password@127.0.0.1:5432/repus?schema=public
+      TEST_DATABASE_URL: postgresql://repus_worker:repus_ci_worker_password@127.0.0.1:5432/repus?schema=public
+      REDIS_URL: redis://127.0.0.1:6379
+      SESSION_SECRET: repus-ci-disposable-session-secret-48-characters-long
+      EMAIL_PROVIDER: development
+      # Synthetic verified operator exists only in this disposable test database.
+      PLATFORM_ADMIN_EMAILS: repus-admin-e2e-ci@example.test
+      E2E_PLATFORM_ADMIN_EMAIL: repus-admin-e2e-ci@example.test
+      EMAIL_FROM_ADDRESS: hello@example.test
+      # Exercise origin normalization in the API, web bundle and account emails.
+      NEXT_PUBLIC_APP_URL: http://localhost:3000/
+      NEXT_PUBLIC_API_URL: http://localhost:4000/
+      API_URL: http://localhost:4000
+      TRACKING_BASE_URL: http://localhost:4000
+      PUBLIC_MEDIA_URL: http://localhost:4000
+      PLATFORM_TIMEZONE: Asia/Kolkata
+      AWS_REGION: ap-south-1
+      AWS_EC2_METADATA_DISABLED: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Dependency security audit
+        run: npm audit --audit-level=high
+      - name: Command launcher regression tests
+        run: npm run test:launcher
+      - name: Bootstrap database roles
+        env:
+          PGHOST: 127.0.0.1
+          PGDATABASE: repus
+          PGUSER: repus
+          PGPASSWORD: repus_ci_owner_password
+          API_DB_PASSWORD: repus_ci_api_password
+          WORKER_DB_PASSWORD: repus_ci_worker_password
+        run: psql -v ON_ERROR_STOP=1 -f infrastructure/postgres/01-application-roles.sql
+      - name: Generate client and apply migrations
+        run: |
+          npm run db:generate
+          npm run db:migrate
+      - name: Unit and PostgreSQL integration tests
+        run: npm test
+      - name: Lint
+        run: npm run lint
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Build all applications
+        run: npm run build
+        env:
+          NODE_ENV: production
+      - name: Install Chromium
+        run: npx --no-install playwright install --with-deps chromium
+      - name: Full-stack browser journey
+        shell: bash
+        run: |
+          mkdir -p .ci-logs
+          export IMPORT_STAGING_DIR="$RUNNER_TEMP/repus-imports"
+          npm run start -w @repus/api > .ci-logs/api.log 2>&1 &
+          api_pid=$!
+          NODE_ENV=production npm run start -w @repus/web > .ci-logs/web.log 2>&1 &
+          web_pid=$!
+          DATABASE_URL="$WORKER_DATABASE_URL" npm run start -w @repus/worker > .ci-logs/worker.log 2>&1 &
+          worker_pid=$!
+          DATABASE_URL="$WORKER_DATABASE_URL" npm run start -w @repus/event-worker > .ci-logs/event-worker.log 2>&1 &
+          event_pid=$!
+          trap 'kill "$api_pid" "$web_pid" "$worker_pid" "$event_pid" 2>/dev/null || true; wait || true' EXIT
+          ready=false
+          for attempt in $(seq 1 90); do
+            for process_pid in "$api_pid" "$web_pid" "$worker_pid" "$event_pid"; do
+              kill -0 "$process_pid" || { cat .ci-logs/*.log; exit 1; }
+            done
+            if node tools/service-readiness.cjs api && node tools/service-readiness.cjs web; then ready=true; break; fi
+            sleep 2
+          done
+          if [ "$ready" != true ]; then cat .ci-logs/*.log; exit 1; fi
+          DATABASE_URL="$WORKER_DATABASE_URL" npx --no-install playwright test
+      - name: Retain lockfile and failure diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-evidence
+          retention-days: 7
+          if-no-files-found: ignore
+          path: |
+            package-lock.json
+            .ci-logs/
+            test-results/
+            playwright-report/
+  compose-acceptance:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      COMPOSE_PROJECT_NAME: repus-compose-ci
+      PLATFORM_TIMEZONE: UTC
+      NODE_ENV: development
+      EMAIL_PROVIDER: development
+      SESSION_SECRET: repus-compose-disposable-session-secret-48-characters
+      POSTGRES_PASSWORD: repus_compose_owner_password
+      API_DB_PASSWORD: repus_compose_api_password
+      WORKER_DB_PASSWORD: repus_compose_worker_password
+      DATABASE_URL: postgresql://repus_api:repus_compose_api_password@127.0.0.1:5432/repus?schema=public
+      WORKER_DATABASE_URL: postgresql://repus_worker:repus_compose_worker_password@127.0.0.1:5432/repus?schema=public
+      PLATFORM_ADMIN_EMAILS: repus-admin-e2e-ci@example.test
+      E2E_PLATFORM_ADMIN_EMAIL: repus-admin-e2e-ci@example.test
+      EMAIL_FROM_ADDRESS: hello@example.test
+      NEXT_PUBLIC_APP_URL: http://localhost:3000
+      NEXT_PUBLIC_API_URL: http://localhost:4000
+      AWS_EC2_METADATA_DISABLED: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install browser test dependencies
+        run: |
+          npm ci --no-audit --no-fund
+          npx --no-install playwright install --with-deps chromium
+      - name: Build and start the disposable Compose stack
+        run: |
+          docker compose config --format json | node -e '
+            const assert = require("node:assert/strict");
+            const {services} = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+            for (const name of ["api", "worker", "event-worker"]) {
+              assert.equal(services[name].environment.PLATFORM_TIMEZONE, process.env.PLATFORM_TIMEZONE,
+                `Compose quota timezone does not match for ${name}`);
+            }
+          '
+          docker compose --profile backups build db-backup
+          docker compose up --build --wait --wait-timeout 180
+      - name: Verify effective Redis durability settings
+        run: |
+          check_redis_setting() {
+            local setting="$1" expected="$2" actual
+            if ! actual=$(docker compose exec -T redis redis-cli --raw CONFIG GET "$setting"); then
+              printf 'Could not read Redis setting %s\n' "$setting" >&2
+              return 1
+            fi
+            if [ "$actual" != "$(printf '%s\n%s' "$setting" "$expected")" ]; then
+              printf 'Expected Redis setting %s to be %s\n' "$setting" "$expected" >&2
+              return 1
+            fi
+          }
+          check_redis_setting appendonly yes
+          check_redis_setting appendfsync everysec
+          check_redis_setting maxmemory-policy noeviction
+      - name: Run the browser journey against Compose
+        run: npm run test:e2e
+      - name: Verify worker and web shutdown
+        run: |
+          docker compose stop worker event-worker web
+          for service in worker event-worker; do
+            container_id=$(docker compose ps --all --quiet "$service")
+            test -n "$container_id"
+            test "$(docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' "$container_id")" = 'exited 0'
+          done
+          web_container_id=$(docker compose ps --all --quiet web)
+          test -n "$web_container_id"
+          # Next.js reports a graceful SIGTERM shutdown with exit status 143.
+          test "$(docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' "$web_container_id")" = 'exited 143'
+      - name: Verify Redis persistence across container replacement
+        run: |
+          redis() { docker compose exec -T redis redis-cli --raw "$@"; }
+          test "$(redis SET repus:compose-acceptance:persistence persisted EX 300)" = 'OK'
+          docker compose stop redis
+          docker compose exec -T api node tools/service-readiness.cjs api-unavailable
+          docker compose up --force-recreate --wait --wait-timeout 60 redis
+          test "$(redis GET repus:compose-acceptance:persistence)" = 'persisted'
+          test "$(redis DEL repus:compose-acceptance:persistence)" = '1'
+          for attempt in $(seq 1 15); do
+            if docker compose exec -T api node tools/service-readiness.cjs api; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo 'API did not recover readiness after Redis replacement.' >&2
+          exit 1
+      - name: Report container state on failure
+        if: failure()
+        run: |
+          docker compose ps --all
+          for id in $(docker compose ps --all --quiet); do
+            docker inspect --format '{{.Name}} status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}{{if .State.Health}} health={{.State.Health.Status}}{{end}}' "$id"
+          done
+      - name: Remove the disposable Compose stack
+        if: always()
+        run: docker compose down --volumes

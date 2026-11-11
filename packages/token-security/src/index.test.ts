@@ -1,0 +1,8 @@
+import {describe,expect,it} from 'vitest';
+import {createOpaqueToken,decryptToken,encryptToken,tokenHash} from './index';
+describe('opaque capabilities',()=>{
+ it('encrypts tokens at rest and hashes them for lookup',()=>{const token=createOpaqueToken(),encrypted=encryptToken(token,'a-test-secret-with-more-than-32-characters');expect(encrypted).not.toBe(token);expect(decryptToken(encrypted,'a-test-secret-with-more-than-32-characters')).toBe(token);expect(tokenHash(token)).not.toBe(token)});
+ it('rejects ciphertext tampering',()=>{const encrypted=encryptToken('capability','a-test-secret-with-more-than-32-characters');const bytes=Buffer.from(encrypted,'base64url');bytes[bytes.length-1]^=1;expect(()=>decryptToken(bytes.toString('base64url'),'a-test-secret-with-more-than-32-characters')).toThrow()});
+ it('rejects alternate encodings even when ignored padding bits decode to the same bytes',()=>{const encrypted=encryptToken('capability','a-test-secret-with-more-than-32-characters');const alphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-';const changed=encrypted.slice(0,-1)+alphabet[alphabet.indexOf(encrypted.at(-1)!)+1];expect(Buffer.from(changed,'base64url')).toEqual(Buffer.from(encrypted,'base64url'));expect(()=>decryptToken(changed,'a-test-secret-with-more-than-32-characters')).toThrow('Invalid encrypted token.');expect(()=>decryptToken(encrypted+'=','a-test-secret-with-more-than-32-characters')).toThrow('Invalid encrypted token.');});
+ it('requires a sufficiently long secret',()=>expect(()=>encryptToken('token','short')).toThrow('at least 32 characters'));
+});

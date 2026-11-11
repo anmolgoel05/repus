@@ -1,0 +1,58 @@
+{
+  "name": "repus",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "predev": "npm run db:generate && npm run build -w @repus/validation && npm run build -w @repus/token-security && npm run build -w @repus/email-renderer && npm run build -w @repus/import-storage",
+    "dev": "node tools/run-with-env.cjs concurrently -n api,web -c blue,green \"npm run dev -w @repus/api\" \"npm run dev -w @repus/web\"",
+    "preworker": "npm run db:generate && npm run build -w @repus/validation && npm run build -w @repus/token-security && npm run build -w @repus/email-renderer && npm run build -w @repus/import-storage",
+    "worker": "node tools/run-with-env.cjs --worker-db npm run dev -w @repus/worker",
+    "preevent-worker": "npm run db:generate && npm run build -w @repus/validation",
+    "event-worker": "node tools/run-with-env.cjs --worker-db npm run dev -w @repus/event-worker",
+    "build": "npm run db:generate && npm run build -w @repus/shared-types && npm run build -w @repus/validation && npm run build -w @repus/token-security && npm run build -w @repus/email-renderer && npm run build -w @repus/import-storage && npm run build --workspaces --if-present",
+    "pretest": "npm run db:generate && npm run build -w @repus/validation && npm run build -w @repus/token-security && npm run build -w @repus/email-renderer && npm run build -w @repus/import-storage",
+    "test": "node tools/run-with-env.cjs npm run test:inner",
+    "test:launcher": "node --test tools/command-launch.test.cjs tools/run-with-env.test.cjs tools/service-readiness.test.cjs",
+    "test:e2e": "npm run db:generate && npm run build -w @repus/token-security && node tools/run-with-env.cjs --worker-db playwright test",
+    "lint": "eslint apps packages --ext .ts,.tsx",
+    "typecheck": "npm run db:generate && npm run build -w @repus/shared-types && npm run build -w @repus/validation && npm run build -w @repus/token-security && npm run build -w @repus/email-renderer && npm run build -w @repus/import-storage && npm run typecheck --workspaces --if-present",
+    "db:generate": "npm run db:generate -w @repus/database",
+    "db:migrate": "node tools/run-with-env.cjs npm run db:migrate -w @repus/database",
+    "db:studio": "node tools/run-with-env.cjs npm run db:studio -w @repus/database",
+    "test:inner": "npm run test:launcher && npm run test:load:guards && npm run test --workspaces --if-present",
+    "test:load:guards": "node --test tools/verify-http-load.test.cjs",
+    "test:load": "node tools/run-with-env.cjs node tools/verify-http-load.cjs",
+    "test:backup": "node tools/run-with-env.cjs node tools/verify-postgres-backup.cjs",
+    "test:recovery": "node tools/run-with-env.cjs node tools/verify-worker-recovery.cjs",
+    "test:redis-recovery": "node tools/run-with-env.cjs node tools/verify-redis-recovery.cjs"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@next/eslint-plugin-next": "^16.4.0",
+    "@playwright/test": "^1.64.1",
+    "concurrently": "^9.1.2",
+    "eslint": "^10.14.0",
+    "typescript-eslint": "^8.72.1",
+    "typescript": "^5.7.3",
+    "vite": "^8.0.0",
+    "pg": "^8.23.1"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7"
+  },
+  "overrides": {
+    "multer": "^2.5.0",
+    "lodash": "^4.18.1",
+    "@nestjs/swagger": {
+      "js-yaml": "^5.5.0"
+    },
+    "minimatch": "^11.0.4"
+  }
+}
